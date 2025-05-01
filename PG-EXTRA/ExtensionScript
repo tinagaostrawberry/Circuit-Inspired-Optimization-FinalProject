@@ -1,0 +1,225 @@
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+import cvxpy as cp
+
+import sys                                                                                           
+sys.path.insert(0, "/home/tinagaostrawberry/Academics/Courses/Opti/finalProjectCODE/optimization_via_circuits-main/opt_problems")
+from decentr_qp import *
+
+import ciropt as co
+
+def pg_extra_seriesPar_c_DAMP(calcCMethod, problem_spec, problem_data, network_data, x_opt_star, f_star, 
+          prox_operators, grad_h, f_plus_h, params=None, printing=False, sc_index_set = None, freq=50) :
+    n_node = problem_spec['n_node']
+    vector_size = problem_spec['vector_size']
+    rho = problem_data['rho']
+
+    itr_num = problem_data['itr_num']
+    W = network_data['W']
+    
+    R, h, CapacitanceS,Capacitance = params["R"], params["h"], params["CapacitanceS"],params["Capacitance"]
+    rho = R
+    step_size_L = h
+    step_size_C_inv = Capacitance / h 
+    
+    R_matrix = 1/R * W
+    G = network_data["G"]
+    adjacency = [[] for _ in range(G.number_of_nodes())]
+    for node, adjacencies in G.adjacency():
+        adjacency[node-1] = [e-1 for e in list(adjacencies.keys())]
+    ####### CALC C  #######
+    if calcCMethod=="criticalDamp":
+        # R=sqrt(R/C) => C=L/R^2=Rjl/R^2
+        C = np.zeros((n_node,1))
+        for jj in range(n_node):
+            W_avg = 0.0
+            for ll in adjacency[jj]:
+                W_avg += W[jj,ll] / len(adjacency[jj])
+            # W = R/Rjl => (1/W)=Rjl/R => Rjl/R^2=(1/W)/R
+            C[jj] = 1/W_avg[jj]/R
+        step_size_Cs_inv = CapacitanceS * C / h 
+    if calcCMethod=="exact":
+        step_size_Cs_inv = CapacitanceS * np.ones((n_node,1)) / h
+    if calcCMethod=="scaledByRMat":
+        C = np.zeros((n_node,1))
+        for jj in range(n_node):
+            R_avg = 0.0
+            for ll in adjacency[jj]:
+                R_avg += R_matrix[jj,ll] / len(adjacency[jj])
+            C[jj] = R_avg
+        step_size_Cs_inv = CapacitanceS * C / h
+    # Calc damping
+    RcsDAMP = 100*(3/40)/(step_size_Cs_inv+np.finfo(float).eps)
+    #######################
+
+    err_opt_star, err_opt_reldiff, op_norm, const_vio, f_reldiff = [], [], [], [], []
+
+    x_0 = np.zeros((n_node,vector_size))
+    x_k = np.array(x_0)
+
+    i_L_0 = np.zeros((n_node,n_node,vector_size))
+    i_L_k = np.array(i_L_0)
+    
+    i_C_0 = np.zeros((n_node,n_node,vector_size))
+    i_C_k = np.array(i_C_0)
+    
+    i_Cs_0 = np.zeros((n_node,vector_size))
+    i_Cs_k = np.array(i_Cs_0)
+
+    for ii in range(itr_num):
+        
+        # Previous vals
+        x_k_prev = np.array(x_k)
+        f_val = 0
+        #
+        i_C_k_prev = np.array(i_C_k)
+        #
+        i_Cs_k_prev = np.array(i_Cs_k)
+        i_L_k_prev = np.array(i_L_k)
+        
+        # Solve for x_k+1
+        for jj in range(n_node) :   
+            sum_iC_iL = np.array(np.zeros(vector_size))
+            for ll in adjacency[jj]:
+                sum_iC_iL += i_L_k_prev[jj][ll] + i_C_k_prev[jj][ll] 
+            e_k_jj = W[jj]@x_k_prev - R * sum_iC_iL - R*i_Cs_k_prev[jj,:] - R * grad_h[jj](x_k_prev[jj])
+            # Update
+            x_k[jj] = prox_operators[jj](e_k_jj, rho)
+            f_val += f_plus_h[jj](x_k[jj])
+        # Update inductor current
+        for jj in range(n_node):
+            for ll in adjacency[jj]:
+                i_L_k[jj][ll] = i_L_k_prev[jj][ll] + step_size_L * R_matrix[jj][ll] * ( x_k_prev[jj] - x_k_prev[ll] )
+        # Upate capacitor in series current
+        for jj in range(n_node):
+            #i_Cs_k[jj,:] = step_size_Cs_inv[jj] * (x_k[jj] - x_k_prev[jj])
+            i_Cs_k[jj,:] = (
+                (step_size_Cs_inv[jj]/(1+RcsDAMP[jj]*step_size_Cs_inv[jj])) *
+                (x_k[jj] - x_k_prev[jj] + RcsDAMP[jj]*i_Cs_k_prev[jj,:])
+            )
+        # Update capacitor currrent
+        for jj in range(n_node):
+            for ll in adjacency[jj]:
+                i_C_k[jj][ll] = i_C_k_prev[jj][ll] + step_size_C_inv * R_matrix[jj][ll] * ( ( x_k[jj] - x_k[ll] ) - ( x_k_prev[jj] - x_k_prev[ll] ) )
+             
+        op_norm.append( np.sum((x_k-x_k_prev)**2)  )
+        err_opt_star.append(np.sqrt(np.sum((x_k - x_opt_star)**2)))
+        err_opt_reldiff.append(np.sqrt(np.sum((x_k - x_opt_star)**2)) / np.sqrt(np.sum((x_0 - x_opt_star)**2)))
+        f_reldiff.append(np.abs((f_val - f_star)/f_star))
+        if printing and (ii % freq == 0 or ii == itr_num-1):
+            print(f"{ii=}, {f_reldiff[-1]=}, {err_opt_reldiff[-1]=}")
+
+    return op_norm, err_opt_star, err_opt_reldiff, const_vio, f_reldiff
+
+################### SET UP PARAMS FOR PROBLEM & GENERATE RANDOM MATRICES ###################
+# random seed
+np.random.seed(108)
+
+# data generation
+problem_spec = {}
+problem_spec['n_node'] = 20 # <--- N = 20 agents!
+problem_spec['vector_size'] = 50
+print(problem_spec)
+
+# Opti poblem is: min (1/N) * SUM(j=1,N){ (x^T)*Qj*x + (pj^T)*x}
+#                 s.t. N = # agents
+#                      (aj^T)*x <= bj
+# problem_data = {Q, p, a, b}
+problem_data = data_generation(problem_spec)
+
+# Defines graph G, mixing matrix W, Vred, and Sred
+# network_data = {G, W, Vred, Sred}
+network_data = graph_generation(problem_spec['n_node'])
+
+problem_data['itr_num'] = 1000
+
+################### CALCULATE SOLUTION USING CVX ######################
+f_star, x_opt_star = min_cvx_quad_constraint(problem_spec, problem_data, True)
+
+################### DEFINE FUNCTIONS AND PROXIMALS TO IMPLEMENT METHOD ###################
+Q = problem_data['Q']
+p = problem_data['p']
+a = problem_data['a']
+b = problem_data['b']
+n_node = problem_spec['n_node']
+vector_size = problem_spec['vector_size']
+
+prox_operators = []
+grad_h = []
+f_plus_h = []
+
+for jj in range(n_node):
+    Qj, pj, aj, bj = Q[jj], p[jj], a[jj], b[jj]
+    # Get prox operator for each node
+    prox_operators += [lambda z, rho, aj=aj, bj=bj : prox_fj_quad_constraint(z, rho, aj, bj) ]
+    
+    # Get gradient (differential part) of obj function at each node
+    # NOTE: Obj function (x^T)*Qj*x + (pj^T)*x is differentiable, so "grad_hj_quad_constraint" method
+    #       simply takes derivative
+    grad_h += [lambda z, Qj=Qj, pj=pj : grad_hj_quad_constraint(z, Qj, pj) ]
+    
+    # The full gradient objective function
+    f_plus_h += [lambda x_kj, Qj=Qj, pj=pj : 1/2 * x_kj @ Qj @ x_kj.T + np.dot(pj, x_kj) ]
+    
+    
+################### FIND PARAMS WITH PG-EXTRA WITH GRID SEARCH ###################
+'''
+def pg_optimization_func(param):
+    problem_data['rho'] = param
+    problem_data['itr_num'] = 400
+    pg_f_reldiff = co.pg_extra("pg_extra", problem_spec, problem_data, network_data, x_opt_star, f_star, prox_operators=prox_operators,
+                                                                    grad_h=grad_h, f_plus_h=f_plus_h,
+                                                                    printing=False)[-1]
+    return pg_f_reldiff
+
+best_rho = round(co.grid_search(pg_optimization_func, np.arange(0.01, 0.1, 0.005), start=300, end=400), 2)
+'''
+best_rho = 0.05
+print("best_rho :", best_rho)
+problem_data['itr_num'] = 1000
+
+################# RUN PG-EXTRA WITH BEST WORKING PARAM ##################################
+problem_data['rho'] = best_rho
+pg_op_norm, pg_err_opt_star, pg_err_opt_reldiff, pg_const_vio, pg_f_reldiff = co.pg_extra("pg_extra", problem_spec, problem_data, 
+                                                                        network_data, x_opt_star, f_star, prox_operators=prox_operators,
+                                                                        grad_h=grad_h, f_plus_h=f_plus_h,
+                                                                        printing=True, freq=200)
+
+################# RUN PG-EXTRA // C -- ORIGINAL ####################################
+params={"R":0.07, "Capacitance":0.3, "h":0.8}  
+pg_c_op_norm, pg_c_err_opt_star, pg_c_err_opt_reldiff, pg_c_const_vio, pg_c_f_reldiff = co.pg_extra(
+                                                                        "pg_extra_par_c", problem_spec, problem_data, 
+                                                                        network_data, x_opt_star, f_star, prox_operators=prox_operators,
+                                                                        grad_h=grad_h, f_plus_h=f_plus_h,
+                                                                        params=params, printing=True, freq=200)
+
+################# RUN PG-EXTRA // C -- DIFF INTEGRATION ####################################
+pg_cSerie_f_reldiff_ALL = []
+CvalALL = [0.2]
+calcCMethod = "exact" # "criticalDamp" "exact" "scaledByRMat"
+for Cval in CvalALL:
+    params={"R":0.07, "CapacitanceS":Cval, "Capacitance":0.3, "h":0.8}  
+    pg_c_op_norm, pg_c_err_opt_star, pg_c_err_opt_reldiff, pg_c_const_vio, pg_cSerie_f_reldiff = pg_extra_seriesPar_c_DAMP(
+                                                                            calcCMethod, problem_spec, problem_data, 
+                                                                            network_data, x_opt_star, f_star, prox_operators=prox_operators,
+                                                                            grad_h=grad_h, f_plus_h=f_plus_h,
+                                                                            params=params, printing=True, freq=200)
+    pg_cSerie_f_reldiff_ALL.append(pg_cSerie_f_reldiff)
+    
+    
+    
+    
+##################### SAVE IN MAT ###################################################
+T = 1000
+
+dictMat = dict()
+dictMat['losses'] = [pg_f_reldiff[:T], pg_c_f_reldiff[:T], pg_cSerie_f_reldiff_ALL[:][:T]]
+dictMat['legend1'] = 'PG-EXTRA'
+dictMat['legend2'] = 'PG-EXTRA // C'
+for cval in CvalALL:
+    legendName = 'legend3_'+str(cval)
+    dictMat[legendName.replace('.','_')] = 'PG-EXTRA - Series + // C with damp (C='+str(cval)+')'
+from scipy.io import savemat
+savemat('PGExtraC_SeriesPar_Damping.mat',dictMat)
